@@ -67,12 +67,14 @@ echo "🔧 Configuring firewall tools..."
 if dpkg -l | grep -q iptables-persistent; then
     echo "iptables-persistent already installed, skipping ufw to avoid conflicts"
     UFW_AVAILABLE=false
+elif command -v ufw >/dev/null 2>&1; then
+    echo "UFW already available"
+    UFW_AVAILABLE=true
 else
-    apt install -y ufw || {
+    apt install -y ufw && UFW_AVAILABLE=true || {
         echo "⚠️  UFW installation failed, using iptables directly"
         UFW_AVAILABLE=false
     }
-    UFW_AVAILABLE=true
 fi
 
 # Install netfilter-persistent if available (helps with iptables persistence)
@@ -111,7 +113,7 @@ systemctl enable wg-quick@wg0
 
 # Configure firewall
 echo "🔥 Configuring firewall..."
-if [[ "$UFW_AVAILABLE" == true ]]; then
+if [[ "$UFW_AVAILABLE" == true ]] && command -v ufw >/dev/null 2>&1; then
     ufw --force reset
     ufw default deny incoming
     ufw default allow outgoing
@@ -123,7 +125,7 @@ if [[ "$UFW_AVAILABLE" == true ]]; then
     ufw --force enable
     echo "✅ UFW firewall configured"
 else
-    echo "⚠️  UFW not available, configuring iptables directly..."
+    echo "🔥 Configuring firewall with iptables..."
     # Clear existing rules
     iptables -F
     iptables -X
@@ -141,7 +143,7 @@ else
     # Allow established connections
     iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     
-    # Allow SSH (adjust port if needed)
+    # Allow SSH (don't lock yourself out!)
     iptables -A INPUT -p tcp --dport 22 -j ACCEPT
     
     # Allow HTTP/HTTPS
@@ -154,13 +156,16 @@ else
     # Allow WireGuard
     iptables -A INPUT -p udp --dport $WG_PORT -j ACCEPT
     
-    # Save rules if netfilter-persistent is available
+    # Try to save rules for persistence
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save
         echo "✅ iptables rules saved with netfilter-persistent"
     elif command -v iptables-save >/dev/null 2>&1; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || echo "⚠️  Could not save iptables rules"
-        echo "✅ iptables rules configured (may not persist across reboots)"
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || echo "⚠️  Could not save iptables rules to file"
+        echo "✅ iptables rules configured (may not persist across reboots without netfilter-persistent)"
+    else
+        echo "⚠️  Could not save iptables rules - they may not persist across reboots"
     fi
 fi
 
