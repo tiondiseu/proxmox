@@ -59,7 +59,24 @@ apt update && apt upgrade -y
 
 # Install required packages
 echo "📦 Installing required packages..."
-apt install -y curl docker.io docker-compose wireguard-tools ufw iptables-persistent
+# Install core packages first
+apt install -y curl docker.io docker-compose wireguard-tools
+
+# Handle iptables-persistent vs ufw conflict
+echo "🔧 Configuring firewall tools..."
+if dpkg -l | grep -q iptables-persistent; then
+    echo "iptables-persistent already installed, skipping ufw to avoid conflicts"
+    UFW_AVAILABLE=false
+else
+    apt install -y ufw || {
+        echo "⚠️  UFW installation failed, using iptables directly"
+        UFW_AVAILABLE=false
+    }
+    UFW_AVAILABLE=true
+fi
+
+# Install netfilter-persistent if available (helps with iptables persistence)
+apt install -y netfilter-persistent || echo "⚠️  netfilter-persistent not available, iptables rules may not persist across reboots"
 
 # Enable and start Docker
 systemctl enable docker
@@ -92,17 +109,60 @@ EOF
 # Enable WireGuard service
 systemctl enable wg-quick@wg0
 
-# Configure UFW firewall
+# Configure firewall
 echo "🔥 Configuring firewall..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow ssh
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw allow $WG_PORT/udp
-ufw allow $NPM_PORT/tcp
-ufw --force enable
+if [[ "$UFW_AVAILABLE" == true ]]; then
+    ufw --force reset
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow ssh
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw allow $WG_PORT/udp
+    ufw allow $NPM_PORT/tcp
+    ufw --force enable
+    echo "✅ UFW firewall configured"
+else
+    echo "⚠️  UFW not available, configuring iptables directly..."
+    # Clear existing rules
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    
+    # Set default policies
+    iptables -P INPUT DROP
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    
+    # Allow loopback
+    iptables -A INPUT -i lo -j ACCEPT
+    
+    # Allow established connections
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    
+    # Allow SSH (adjust port if needed)
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+    
+    # Allow HTTP/HTTPS
+    iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+    iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+    
+    # Allow NPM web interface
+    iptables -A INPUT -p tcp --dport $NPM_PORT -j ACCEPT
+    
+    # Allow WireGuard
+    iptables -A INPUT -p udp --dport $WG_PORT -j ACCEPT
+    
+    # Save rules if netfilter-persistent is available
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save
+        echo "✅ iptables rules saved with netfilter-persistent"
+    elif command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || echo "⚠️  Could not save iptables rules"
+        echo "✅ iptables rules configured (may not persist across reboots)"
+    fi
+fi
 
 # Create Nginx Proxy Manager setup
 echo "🔧 Setting up Nginx Proxy Manager..."
@@ -182,7 +242,7 @@ echo "$VPS_PUBLIC_KEY"
 echo ""
 echo "📝 Next Step - Run this command on your Proxmox host:"
 echo ""
-echo "curl -fsSL https://raw.githubusercontent.com/tiondiseu/proxmox/main/home-bootstrap.sh | bash -s -- \\"
+echo "curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/home-bootstrap.sh | bash -s -- \\"
 echo "  --vps-ip $VPS_PUBLIC_IP \\"
 echo "  --wg-port $WG_PORT \\"
 echo "  --home-ip 10.99.0.2/24 \\"
