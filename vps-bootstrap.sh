@@ -1,14 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# VPS Bootstrap Script - Sets up WireGuard + Nginx Proxy Manager
-# Usage: bash vps-bootstrap.sh --domain example.com [--wg-port 51820] [--npm-port 81]
+# VPS Bootstrap Script - Routed WireGuard + Reverse Proxy
+# Usage: curl -fsSL https://your-repo/vps-bootstrap.sh | bash -s -- --domain yourdomain.com
 
-# Default values
-WG_PORT=51820
-NPM_PORT=81
 DOMAIN=""
-VPS_PUBLIC_IP=""
+WG_PORT=51820
+VPS_WG_IP="10.100.0.1/24"
+HOME_WG_IP="10.100.0.2"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -17,17 +16,8 @@ while [[ $# -gt 0 ]]; do
             DOMAIN="$2"
             shift 2
             ;;
-        --wg-port)
-            WG_PORT="$2"
-            shift 2
-            ;;
-        --npm-port)
-            NPM_PORT="$2"
-            shift 2
-            ;;
         *)
-            echo "Unknown option $1"
-            echo "Usage: $0 --domain example.com [--wg-port 51820] [--npm-port 81]"
+            echo "Unknown option: $1"
             exit 1
             ;;
     esac
@@ -35,144 +25,78 @@ done
 
 if [[ -z "$DOMAIN" ]]; then
     echo "Error: --domain is required"
-    echo "Usage: $0 --domain example.com [--wg-port 51820] [--npm-port 81]"
     exit 1
 fi
 
-echo "🚀 VPS Bootstrap Script Starting..."
-echo "Domain: $DOMAIN"
-echo "WireGuard Port: $WG_PORT"
-echo "NPM Web UI Port: $NPM_PORT"
-
-# Detect VPS public IP
-echo "🔍 Detecting VPS public IP..."
-VPS_PUBLIC_IP=$(curl -s4 ifconfig.me || curl -s4 icanhazip.com || echo "")
-if [[ -z "$VPS_PUBLIC_IP" ]]; then
-    echo "❌ Could not detect public IP. Please check your connection."
-    exit 1
-fi
-echo "✅ Detected VPS Public IP: $VPS_PUBLIC_IP"
+echo "🚀 Bootstrapping VPS for domain: $DOMAIN"
 
 # Update system
-echo "📦 Updating system packages..."
+echo "📦 Updating system..."
 apt update && apt upgrade -y
-
-# Install required packages
-echo "📦 Installing required packages..."
-# Install core packages first
-apt install -y curl docker.io docker-compose wireguard-tools
-
-# Handle iptables-persistent vs ufw conflict
-echo "🔧 Configuring firewall tools..."
-if dpkg -l | grep -q iptables-persistent; then
-    echo "iptables-persistent already installed, skipping ufw to avoid conflicts"
-    UFW_AVAILABLE=false
-elif command -v ufw >/dev/null 2>&1; then
-    echo "UFW already available"
-    UFW_AVAILABLE=true
-else
-    apt install -y ufw && UFW_AVAILABLE=true || {
-        echo "⚠️  UFW installation failed, using iptables directly"
-        UFW_AVAILABLE=false
-    }
-fi
-
-# Install netfilter-persistent if available (helps with iptables persistence)
-apt install -y netfilter-persistent || echo "⚠️  netfilter-persistent not available, iptables rules may not persist across reboots"
-
-# Enable and start Docker
-systemctl enable docker
-systemctl start docker
-
-# Add current user to docker group (if not root)
-if [[ $EUID -ne 0 ]]; then
-    usermod -aG docker $USER
-fi
+apt install -y wireguard iptables-persistent ufw curl
 
 # Generate WireGuard keys
 echo "🔑 Generating WireGuard keys..."
 VPS_PRIVATE_KEY=$(wg genkey)
 VPS_PUBLIC_KEY=$(echo "$VPS_PRIVATE_KEY" | wg pubkey)
+HOME_PRIVATE_KEY=$(wg genkey)
+HOME_PUBLIC_KEY=$(echo "$HOME_PRIVATE_KEY" | wg pubkey)
 
-# Create WireGuard configuration
-echo "⚙️ Creating WireGuard configuration..."
-mkdir -p /etc/wireguard
+# Get VPS public IP
+VPS_PUBLIC_IP=$(curl -s ifconfig.me)
+
+# Configure WireGuard on VPS
+echo "⚙️ Creating VPS WireGuard configuration..."
 cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
-Address = 10.99.0.1/24
-ListenPort = $WG_PORT
 PrivateKey = $VPS_PRIVATE_KEY
-PostUp = sysctl -w net.ipv4.ip_forward=1
-PostUp = ip link set %i mtu 1420
+Address = $VPS_WG_IP
+ListenPort = $WG_PORT
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT
 
-# Peer will be added after home setup
+[Peer]
+PublicKey = $HOME_PUBLIC_KEY
+AllowedIPs = 10.100.0.2/32
 EOF
 
-# Enable WireGuard service
+# Configure firewall BEFORE starting Docker
+echo "🔥 Configuring UFW firewall..."
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow ssh
+ufw allow $WG_PORT/udp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw --force enable
+
+# Enable IP forwarding
+echo "🌐 Enabling IP forwarding..."
+echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -p
+
+# Start WireGuard
+echo "🔗 Starting WireGuard..."
 systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
 
-# Configure firewall
-echo "🔥 Configuring firewall..."
-if [[ "$UFW_AVAILABLE" == true ]] && command -v ufw >/dev/null 2>&1; then
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow ssh
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    ufw allow $WG_PORT/udp
-    ufw allow $NPM_PORT/tcp
-    ufw --force enable
-    echo "✅ UFW firewall configured"
-else
-    echo "🔥 Configuring firewall with iptables..."
-    # Clear existing rules
-    iptables -F
-    iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    
-    # Set default policies
-    iptables -P INPUT DROP
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
-    
-    # Allow loopback
-    iptables -A INPUT -i lo -j ACCEPT
-    
-    # Allow established connections
-    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-    
-    # Allow SSH (don't lock yourself out!)
-    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-    
-    # Allow HTTP/HTTPS
-    iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-    iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-    
-    # Allow NPM web interface
-    iptables -A INPUT -p tcp --dport $NPM_PORT -j ACCEPT
-    
-    # Allow WireGuard
-    iptables -A INPUT -p udp --dport $WG_PORT -j ACCEPT
-    
-    # Try to save rules for persistence
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save
-        echo "✅ iptables rules saved with netfilter-persistent"
-    elif command -v iptables-save >/dev/null 2>&1; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || echo "⚠️  Could not save iptables rules to file"
-        echo "✅ iptables rules configured (may not persist across reboots without netfilter-persistent)"
-    else
-        echo "⚠️  Could not save iptables rules - they may not persist across reboots"
-    fi
-fi
+# Install Docker (after firewall setup)
+echo "🐳 Installing Docker..."
+curl -fsSL https://get.docker.com -o get-docker.sh
+sh get-docker.sh
+systemctl enable docker
+systemctl start docker
 
-# Create Nginx Proxy Manager setup
+# Wait for Docker to fully initialize
+sleep 5
+
+# Install Nginx Proxy Manager
 echo "🔧 Setting up Nginx Proxy Manager..."
-mkdir -p /opt/npm
-cat > /opt/npm/docker-compose.yml << EOF
+mkdir -p /opt/nginx-proxy-manager
+cd /opt/nginx-proxy-manager
+
+cat > docker-compose.yml << EOF
 version: '3.8'
 services:
   nginx-proxy-manager:
@@ -181,81 +105,35 @@ services:
     ports:
       - '80:80'
       - '443:443'
-      - '$NPM_PORT:81'
+      - '81:81'
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
     environment:
-      DISABLE_IPV6: 'true'
+      DB_SQLITE_FILE: "/data/database.sqlite"
 EOF
 
 # Start Nginx Proxy Manager
-cd /opt/npm
 docker-compose up -d
 
-# Enable IP forwarding permanently
-echo "🌐 Enabling IP forwarding..."
-echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-sysctl -p
-
-# Create helper script to add peer
-cat > /root/add-home-peer.sh << 'EOF'
-#!/bin/bash
-# Usage: bash add-home-peer.sh <HOME_PUBLIC_KEY> <HOME_LAN_CIDR>
-HOME_PUB_KEY="$1"
-HOME_LAN_CIDR="$2"
-
-if [[ -z "$HOME_PUB_KEY" || -z "$HOME_LAN_CIDR" ]]; then
-    echo "Usage: $0 <HOME_PUBLIC_KEY> <HOME_LAN_CIDR>"
-    echo "Example: $0 ABC123def456... 192.168.50.0/24"
-    exit 1
-fi
-
-# Add peer to WireGuard config
-cat >> /etc/wireguard/wg0.conf << EOL
-
-[Peer]
-PublicKey = $HOME_PUB_KEY
-AllowedIPs = 10.99.0.2/32, $HOME_LAN_CIDR
-PersistentKeepalive = 25
-EOL
-
-# Restart WireGuard
-wg-quick down wg0 2>/dev/null || true
-wg-quick up wg0
-systemctl restart wg-quick@wg0
-
-echo "✅ Home peer added successfully!"
-echo "WireGuard status:"
-wg show
-EOF
-
-chmod +x /root/add-home-peer.sh
-
 echo ""
-echo "🎉 VPS Bootstrap Complete!"
+echo "✅ VPS Setup Complete!"
 echo ""
-echo "📋 Setup Summary:"
-echo "- VPS Public IP: $VPS_PUBLIC_IP"
-echo "- WireGuard Port: $WG_PORT"
-echo "- WireGuard VPS IP: 10.99.0.1/24"
-echo "- Nginx Proxy Manager: http://$VPS_PUBLIC_IP:$NPM_PORT"
+echo "📋 Connection Details:"
+echo "VPS Public IP: $VPS_PUBLIC_IP"
+echo "VPS WireGuard IP: 10.100.0.1"
+echo "Home WireGuard IP: 10.100.0.2"
+echo "Nginx Proxy Manager: http://$VPS_PUBLIC_IP:81"
 echo "  Default login: admin@example.com / changeme"
 echo ""
-echo "🔑 VPS WireGuard Public Key:"
-echo "$VPS_PUBLIC_KEY"
-echo ""
-echo "📝 Next Step - Run this command on your Proxmox host:"
-echo ""
-echo "curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/home-bootstrap.sh | bash -s -- \\"
+echo "🏠 Run this on your home edge VM/container:"
+echo "curl -fsSL https://your-repo/home-bootstrap.sh | bash -s -- \\"
 echo "  --vps-ip $VPS_PUBLIC_IP \\"
-echo "  --wg-port $WG_PORT \\"
-echo "  --home-ip 10.99.0.2/24 \\"
-echo "  --lan-if vmbr0 \\"
-echo "  --vps-pub \"$VPS_PUBLIC_KEY\" \\"
-echo "  --lan-cidr 192.168.50.0/24"
+echo "  --vps-port $WG_PORT \\"
+echo "  --vps-key '$VPS_PUBLIC_KEY' \\"
+echo "  --home-key '$HOME_PRIVATE_KEY'"
 echo ""
-echo "⚠️  Important: Point your domain '$DOMAIN' A record to $VPS_PUBLIC_IP"
-echo ""
-echo "🔧 After home setup, you'll need to run on VPS:"
-echo "bash /root/add-home-peer.sh \"<HOME_PUBLIC_KEY>\" \"192.168.50.0/24\""
+echo "📖 Next steps:"
+echo "1. Run the home bootstrap script"
+echo "2. Configure proxy rules in NPM to forward to 10.100.0.2:PORT"
+echo "3. Point your domain DNS to $VPS_PUBLIC_IP"
